@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>多重测序条码子库审计</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>多重测序条码子库审计</h1>
+    <p class="subtitle">
+      在正向与反向互补组合的最小汉明距离约束下，精确选出优先权总和最大、
+      继而记录数最多的子库，并给出任意精度的同优方案数与逐记录归属。
+    </p>
+  </header>
+
+  <main>
+    <section class="panel" aria-labelledby="input-title">
+      <div class="panel-head">
+        <h2 id="input-title">条码录入 <span class="hint">（10–44 条，条码为等长 A/C/G/T 且唯一；优先权、阈值为正整数）</span></h2>
+        <div class="row-actions">
+          <button type="button" id="btn-add" class="btn">＋ 增加一行</button>
+          <button type="button" id="btn-demo" class="btn btn-ghost">载入示例</button>
+          <button type="button" id="btn-clear" class="btn btn-ghost">清空</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="grid" id="input-table">
+          <thead>
+            <tr>
+              <th class="col-idx">#</th>
+              <th>条码（A/C/G/T，等长）</th>
+              <th class="col-num">优先权</th>
+              <th class="col-num">距离阈值</th>
+              <th class="col-op"></th>
+            </tr>
+          </thead>
+          <tbody id="input-body"></tbody>
+        </table>
+      </div>
+
+      <div class="control-row">
+        <button type="button" id="btn-audit" class="btn btn-primary">启动审计</button>
+        <button type="button" id="btn-cancel" class="btn btn-danger" disabled>取消审计</button>
+        <span id="row-count" class="row-count" aria-live="polite"></span>
+      </div>
+
+      <div class="progress-wrap" id="progress-wrap" hidden>
+        <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+        <span class="progress-label" id="progress-label">计算中…</span>
+      </div>
+
+      <div id="form-errors" class="form-errors" role="alert" hidden></div>
+      <div id="notice" class="notice" role="status" hidden></div>
+    </section>
+
+    <section class="panel" id="result-panel" aria-labelledby="result-title" hidden>
+      <h2 id="result-title">最近一次成功结论</h2>
+      <div class="cards">
+        <div class="card">
+          <div class="card-label">最大优先权总和</div>
+          <div class="card-value" id="r-priority">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">规范子库记录数</div>
+          <div class="card-value" id="r-count">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">双层最优同优方案数（任意精度）</div>
+          <div class="card-value mono" id="r-optcount">—</div>
+        </div>
+        <div class="card card-wide">
+          <div class="card-label">规范结果位向量（按输入次序，1 优先）</div>
+          <div class="card-value mono bitvector" id="r-bitvector">—</div>
+        </div>
+      </div>
+
+      <div class="legend">
+        <span class="tag tag-mandatory">必选</span> 出现在全部双层最优方案中
+        <span class="tag tag-optional">可选</span> 仅出现在部分最优方案中
+        <span class="tag tag-never">从不选</span> 不出现于任何最优方案（含反向互补自冲突者）
+      </div>
+
+      <div class="table-wrap">
+        <table class="grid result-grid" id="result-table">
+          <thead>
+            <tr>
+              <th class="col-idx">#</th>
+              <th>条码</th>
+              <th>反向互补</th>
+              <th class="col-num">优先权</th>
+              <th class="col-num">阈值</th>
+              <th class="col-num">自互补距离</th>
+              <th>归属</th>
+              <th>规范子库</th>
+            </tr>
+          </thead>
+          <tbody id="result-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">计算在浏览器内 Web Worker 中完成；取消、非法输入与旧任务迟到消息均不会覆盖最近一次成功结论。</footer>
+
+  <script type="module" src="/ui.js"></script>
+</body>
+</html>

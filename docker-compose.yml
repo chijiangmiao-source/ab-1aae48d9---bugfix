@@ -1,0 +1,37 @@
+# Docker Compose：页面服务 + 名为 verify 的单次核验服务。
+#
+# 启动页面（端口可用 WEB_PORT 配置，默认 8080）：
+#   docker compose up web
+#   WEB_PORT=9090 docker compose up web
+#
+# 执行一次性核验（代码测试 + 构建检查 + HTTP 冒烟，退出码即成败）：
+#   docker compose up --abort-on-container-exit --exit-code-from verify
+services:
+  web:
+    build: .
+    image: barcode-subpool-audit:latest
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    ports:
+      # 宿主可配置端口 -> 容器固定 8080
+      - "${WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  verify:
+    # 单次服务：等待 web 健康后执行 test/构建检查/HTTP 冒烟，退出码报告成败
+    image: barcode-subpool-audit:latest
+    build: .
+    command: ["node", "scripts/verify.mjs"]
+    environment:
+      BASE_URL: "http://web:8080"
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: "no"

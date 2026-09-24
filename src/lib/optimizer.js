@@ -132,7 +132,107 @@ function better(w1, s1, w2, s2) {
 // opts.onProgress(p): 0..1 进度回调
 // opts.tick(): 周期性 await 的异步让步点（Worker 借此让取消消息进入事件循环）；
 //              其抛出的异常会原样传播
+//
+// 先按连通分量分解：不同分量之间没有任何互斥边，双层最优解等于各分量最优解的
+// 笛卡尔积——权和与记录数相加、同优方案数相乘，归属与规范位向量按分量独立裁决。
+// 这对“大量互不冲突的小簇”（如 22 个互斥对）至关重要：直接对 44 个顶点做
+// MITM 会枚举跨分量的 2^22 组合，复杂度随整图规模指数膨胀；分解后只随最大分量
+// 指数增长。连通图（最坏情况）仍走原 MITM，行为不变。
 export async function solveGraph(weights, adj, opts = {}) {
+  const shouldCancel = opts.shouldCancel ?? (() => false);
+  const onProgress = opts.onProgress ?? (() => {});
+  const tick = opts.tick ?? null;
+  const n = weights.length;
+
+  const result = {
+    totalPriority: 0n,
+    selectedCount: 0,
+    optimalCount: 1n,
+    canonical: new Uint8Array(n),
+    status: new Array(n).fill('never'),
+  };
+  if (n === 0) return result;
+
+  const components = connectedComponents(weights, adj);
+  const C = components.length;
+  for (let c = 0; c < C; c++) {
+    if (shouldCancel()) throw new AuditCanceled();
+    if (tick && c > 0) await tick();
+
+    // 分量内沿用全局输入次序（verts 已升序），规范位向量的字典序语义保持不变
+    const verts = components[c];
+    const m = verts.length;
+    const subWeights = new Array(m);
+    const subAdj = new Array(m).fill(0n);
+    for (let i = 0; i < m; i++) subWeights[i] = BigInt(weights[verts[i]]);
+    for (let i = 0; i < m; i++) {
+      const row = adj[verts[i]];
+      for (let j = i + 1; j < m; j++) {
+        if ((row >> BigInt(verts[j])) & 1n) {
+          subAdj[i] |= 1n << BigInt(j);
+          subAdj[j] |= 1n << BigInt(i);
+        }
+      }
+    }
+
+    const sub = await solveComponent(subWeights, subAdj, {
+      shouldCancel,
+      tick,
+      onProgress: (p) => onProgress(Math.min(1, (c + p) / C)),
+    });
+
+    result.totalPriority += sub.totalPriority;
+    result.selectedCount += sub.selectedCount;
+    result.optimalCount *= sub.optimalCount;
+    for (let i = 0; i < m; i++) {
+      const gv = verts[i];
+      result.canonical[gv] = sub.canonical[i];
+      result.status[gv] = sub.status[i];
+    }
+  }
+  onProgress(1);
+  return result;
+}
+
+// 连通分量分解（n <= 44，邻接为 BigInt 位掩码）。分量按其最小顶点的出现顺序
+// 返回，分量内顶点按全局索引升序，保证输入次序语义稳定。
+export function connectedComponents(weights, adj) {
+  const n = weights.length;
+  const seen = new Uint8Array(n);
+  const components = [];
+  for (let s = 0; s < n; s++) {
+    if (seen[s]) continue;
+    seen[s] = 1;
+    const verts = [];
+    const stack = [s];
+    while (stack.length) {
+      const v = stack.pop();
+      verts.push(v);
+      let bits = adj[v];
+      while (bits) {
+        const low = bits & -bits;
+        const u = lowestBitIndexBig(low);
+        if (!seen[u]) {
+          seen[u] = 1;
+          stack.push(u);
+        }
+        bits ^= low;
+      }
+    }
+    verts.sort((a, b) => a - b);
+    components.push(verts);
+  }
+  return components;
+}
+
+function lowestBitIndexBig(bits) {
+  const lo = Number(bits & 0xFFFFFFFFn);
+  if (lo !== 0) return 31 - Math.clz32(lo);
+  return 32 + 31 - Math.clz32(Number(bits >> 32n));
+}
+
+// 单个连通分量上的双层最优独立集（MITM 折半枚举，每半 <= 22）。
+async function solveComponent(weights, adj, opts = {}) {
   const shouldCancel = opts.shouldCancel ?? (() => false);
   const onProgress = opts.onProgress ?? (() => {});
   const tick = opts.tick ?? null;
@@ -312,7 +412,7 @@ export async function solveGraph(weights, adj, opts = {}) {
     }
   }
 
-  // ---------- 第二遍：任意精度计数 + 各顶点出现在最优方案中的次数 ----------
+  // ---------- 第二遍：任意精度计数 + 各顶点出现在最优解中的次数 ----------
   let total = 0n;
   const containA = new Array(n1).fill(0n);
   const containB = new Array(n2).fill(0n);

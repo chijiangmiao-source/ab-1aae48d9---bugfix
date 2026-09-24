@@ -183,56 +183,6 @@ export async function solveGraph(weights, adj, opts = {}) {
     nb[u] = m;
   }
 
-  // ---------- A 侧子集 DP：g[mask] = mask 内（权, 数）双层最优独立集 ----------
-  async function scanAllowedA(allowed) {
-    let bestWeight = -1n;
-    let bestSize = -1;
-    let count = 0n;
-    let contain = new Array(n1).fill(0n);
-    let visits = 0;
-
-    for (let candidate = allowed; ; candidate = (candidate - 1) & allowed) {
-      let independent = true;
-      let weight = 0n;
-      let size = 0;
-      let bits = candidate;
-      while (bits) {
-        const v = 31 - Math.clz32(bits);
-        const bit = 1 << v;
-        if (na[v] & candidate) {
-          independent = false;
-          break;
-        }
-        weight += wA[v];
-        size++;
-        bits ^= bit;
-      }
-
-      if (independent) {
-        const cmp = better(weight, size, bestWeight, bestSize);
-        if (cmp > 0) {
-          bestWeight = weight;
-          bestSize = size;
-          count = 1n;
-          contain = new Array(n1).fill(0n);
-          for (let v = 0; v < n1; v++) if (candidate & (1 << v)) contain[v] = 1n;
-        } else if (cmp === 0) {
-          count++;
-          for (let v = 0; v < n1; v++) if (candidate & (1 << v)) contain[v]++;
-        }
-      }
-
-      if (candidate === 0) break;
-      visits++;
-      if ((visits & 0xffff) === 0) {
-        if (tick) await tick();
-        if (shouldCancel()) throw new AuditCanceled();
-      }
-    }
-
-    return { weight: bestWeight, size: bestSize, count, contain };
-  }
-
   // ---------- B 侧：显式栈枚举全部独立集（按批让出事件循环，响应取消） ----------
   const cap = n2 === 0 ? 1 : 1 << n2;
   const yMask = new Uint32Array(cap);
@@ -289,28 +239,83 @@ export async function solveGraph(weights, adj, opts = {}) {
     }
 
     if (top > 0) {
-      onProgress(Math.min(0.99, nodes / (2 * cap)));
+      onProgress(0.5 * Math.min(1, nodes / (2 * cap)));
       if (tick) await tick();
       if (shouldCancel()) throw new AuditCanceled();
     }
   }
-  onProgress(1);
+  onProgress(0.5);
 
   const fullA = n1 === 0 ? 0 : (1 << n1) - 1;
+
+  // ---------- A 侧子集 DP（整表只建一次） ----------
+  // 对 A 的每个子集 mask（视作允许集合），g[mask] = mask 内（权, 数）
+  // 双层最优独立集。B 侧每个独立集只需用 yForb 在 O(1) 内查表合并，
+  // 避免对最多 2^22 个 Y 集合各自重复枚举 2^22 个 A 子集（整体退化到 2^44）。
+  const capA = n1 === 0 ? 1 : 1 << n1;
+  const gW = makeW(capA); // 最优权
+  const gS = new Int32Array(capA); // 最优记录数
+  // 最优方案数：单半 ≤ 22 顶点，独立集至多 2^22 个，Uint32 足够
+  const gC = new Uint32Array(capA);
+  gW[0] = 0n; gS[0] = 0; gC[0] = 1;
+  for (let mask = 1; mask < capA; mask++) {
+    if ((mask & 0xffff) === 0) {
+      if (tick) await tick();
+      if (shouldCancel()) throw new AuditCanceled();
+    }
+    const v = 31 - Math.clz32(mask & -mask); // 最高置位位
+    const rest = mask ^ (1 << v);
+    // 选项 1：不选 v；选项 2：选 v（封锁 v 在 A 中的邻居）
+    const m1 = rest & ~na[v];
+    const w0 = gW[rest], s0 = gS[rest];
+    const w1 = gW[m1] + wA[v];
+    const s1 = gS[m1] + 1;
+    const cmp = better(w1, s1, w0, s0);
+    if (cmp > 0) {
+      gW[mask] = w1; gS[mask] = s1; gC[mask] = gC[m1];
+    } else if (cmp < 0) {
+      gW[mask] = w0; gS[mask] = s0; gC[mask] = gC[rest];
+    } else {
+      gW[mask] = w0; gS[mask] = s0;
+      gC[mask] = gC[rest] + gC[m1]; // 单半至多 2^22，不溢出 Uint32
+    }
+  }
+  onProgress(0.65);
+
+  // 固定 Y 集合后，A 侧允许集合 m 中包含顶点 v 的最优独立集数量：
+  // 选 v 后子问题为 m \ ({v} ∪ N(v))，仅当“选 v”分支本身达到 m 的
+  // 双层最优时才有贡献。全部为 O(1) 查表。
+  const inclA = new Uint32Array(n1);
+  function inclusionInM(m) {
+    let bits = m;
+    while (bits) {
+      const v = 31 - Math.clz32(bits);
+      const bit = 1 << v;
+      const m1 = m & ~bit & ~na[v];
+      inclA[v] = gW[m1] + wA[v] === gW[m] && gS[m1] + 1 === gS[m] ? gC[m1] : 0;
+      bits ^= bit;
+    }
+    return inclA;
+  }
 
   // ---------- 第一遍扫描：确定全局双层最优 (bestW, bestS) ----------
   let bestW = -1n;
   let bestS = -1;
   for (let k = 0; k < K; k++) {
+    if ((k & 0xffff) === 0) {
+      onProgress(0.65 + 0.07 * (k / K));
+      if (tick) await tick();
+      if (shouldCancel()) throw new AuditCanceled();
+    }
     const m = fullA & ~yForb[k];
-    const a = await scanAllowedA(m);
-    const W = yW[k] + a.weight;
-    const S = yS[k] + a.size;
+    const W = yW[k] + gW[m];
+    const S = yS[k] + gS[m];
     if (better(W, S, bestW, bestS) > 0) {
       bestW = W;
       bestS = S;
     }
   }
+  onProgress(0.72);
 
   // ---------- 第二遍：任意精度计数 + 各顶点出现在最优方案中的次数 ----------
   let total = 0n;
@@ -318,15 +323,13 @@ export async function solveGraph(weights, adj, opts = {}) {
   const containB = new Array(n2).fill(0n);
   for (let k = 0; k < K; k++) {
     if ((k & 0xffff) === 0) {
+      onProgress(0.72 + 0.16 * (k / K));
       if (tick) await tick();
       if (shouldCancel()) throw new AuditCanceled();
     }
     const m = fullA & ~yForb[k];
-    const a = await scanAllowedA(m);
-    const W = yW[k] + a.weight;
-    const S = yS[k] + a.size;
-    if (W !== bestW || S !== bestS) continue;
-    const cnt = a.count;
+    if (yW[k] + gW[m] !== bestW || yS[k] + gS[m] !== bestS) continue;
+    const cnt = BigInt(gC[m]);
     total += cnt;
 
     // B 顶点：随 Y 直接计入
@@ -337,11 +340,12 @@ export async function solveGraph(weights, adj, opts = {}) {
       bits ^= 1 << b;
     }
 
-    // A 顶点：在固定 Y 下，统计取到 g[m] 且包含 v 的 A 最优集数量
-    for (let v = 0; v < n1; v++) {
-      containA[v] += a.contain[v];
-    }
+    // A 顶点：查表得 m 的最优集中包含 v 的数量
+    inclA.fill(0);
+    const incl = inclusionInM(m);
+    for (let v = 0; v < n1; v++) if (incl[v]) containA[v] += BigInt(incl[v]);
   }
+  onProgress(0.88);
 
   for (let v = 0; v < n1; v++) {
     status[v] = containA[v] === 0n ? 'never' : containA[v] === total ? 'mandatory' : 'optional';
@@ -353,36 +357,30 @@ export async function solveGraph(weights, adj, opts = {}) {
   // ---------- 规范位向量：输入次序下“选中优先”的逐位贪心 ----------
   // 按输入次序逐位裁决：某位能取 1（存在与此前裁决相容的最优方案）则取 1，
   // 否则取 0。结果是所有最优位向量中字典序最大者（1 优先的规范代表）。
+  // 已裁决必选 A 顶点的权重/邻居增量随 pa 增量维护。
   let pa = 0, qa = 0, pb = 0, qb = 0;
   const chosen = new Uint8Array(n);
+  let wpa = 0n, spa = 0, blockA = 0;
 
-  async function existsOptimal() {
-    let block = 0;
-    let wpa = 0n;
-    let spa = 0;
-    let bits = pa;
-    while (bits) {
-      const v = 31 - Math.clz32(bits);
-      block |= na[v];
-      wpa += wA[v];
-      spa++;
-      bits ^= 1 << v;
-    }
-    if (pa & block) return false; // 强制选中集合内部冲突
-    const allowed = fullA & ~qa & ~pa & ~block;
+  async function existsOptimal(v) {
+    if (pa & blockA) return false; // 强制选中集合内部冲突
+    const allowed = fullA & ~qa & ~pa & ~blockA;
+    let scanned = 0;
     for (let k = 0; k < K; k++) {
-      if ((k & 0xffff) === 0) {
-        if (tick) await tick();
-        if (shouldCancel()) throw new AuditCanceled();
-      }
       const ym = yMask[k];
       if ((ym & pb) !== pb) continue;
       if (ym & qb) continue;
       if (yForb[k] & pa) continue;
       const m = allowed & ~yForb[k];
-      const a = await scanAllowedA(m);
-      if (yW[k] + wpa + a.weight === bestW && yS[k] + spa + a.size === bestS) {
+      if (yW[k] + wpa + gW[m] === bestW && yS[k] + spa + gS[m] === bestS) {
         return true;
+      }
+      // 每约 2^20 个 B 集合让步一次（单段约毫秒级，保证取消及时响应）
+      if (++scanned === (1 << 20)) {
+        scanned = 0;
+        onProgress(0.88 + 0.12 * (v / n));
+        if (tick) await tick();
+        if (shouldCancel()) throw new AuditCanceled();
       }
     }
     return false;
@@ -391,17 +389,33 @@ export async function solveGraph(weights, adj, opts = {}) {
   for (let v = 0; v < n; v++) {
     if (shouldCancel()) throw new AuditCanceled();
     if (v < n1) {
+      // 试探：强制 v 入选
       pa |= 1 << v;
-      if (await existsOptimal()) {
+      blockA |= na[v];
+      wpa += wA[v];
+      spa++;
+      const exists = await existsOptimal(v);
+      if (exists) {
         chosen[v] = 1;
       } else {
         pa ^= 1 << v;
+        wpa -= wA[v];
+        spa--;
+        // 已选顶点可能共享邻居，回滚时按 pa 重算封锁集，避免误清
+        blockA = 0;
+        let pb2 = pa;
+        while (pb2) {
+          const x = 31 - Math.clz32(pb2);
+          blockA |= na[x];
+          pb2 ^= 1 << x;
+        }
         qa |= 1 << v;
       }
     } else {
       const u = v - n1;
-      pb |= 1 << u;
-      if (await existsOptimal()) {
+      pb |= 1 << u; // 试探：强制该 B 顶点入选
+      const exists = await existsOptimal(v);
+      if (exists) {
         chosen[v] = 1;
       } else {
         pb ^= 1 << u;
@@ -409,6 +423,7 @@ export async function solveGraph(weights, adj, opts = {}) {
       }
     }
   }
+  onProgress(1);
 
   return {
     totalPriority: bestW,
